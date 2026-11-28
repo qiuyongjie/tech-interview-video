@@ -1,130 +1,218 @@
 #!/usr/bin/env python3
-"""compose_video.py — 合成最终视频：插帧、拼场景、混音、烧字幕。
+"""Compose scene frames + narration into the final MP4, with loudness and ffprobe checks."""
+from __future__ import annotations
 
-用法:
-    python compose_video.py plan.json --out video.mp4
-plan.json 格式:
-    {
-      "fps_out": 30,
-      "cover": "assets/cover.png",            // 可选, 展示 2s
-      "scenes": [
-        {"name": "scene_01", "frames_dir": "frames/scene_01",
-         "fps_in": 12, "audio": "audio/scene_01.wav",
-         "subtitle": "旁白文本..."}
-      ]
-    }
-
-流程: 每场景 帧12fps->30fps (minterpolate) + 音频对齐 -> 烧字幕 -> concat -> 封面。
-依赖: ffmpeg / ffprobe。
-"""
+import argparse
 import json
+import re
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
-COVER_SEC = 2.0
+
+def ffmpeg(*args: object) -> None:
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *[str(a) for a in args]], check=True)
 
 
-def run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stderr[-3000:])
-        sys.exit(f"命令失败: {' '.join(map(str, cmd))}")
+def ffprobe(path: Path) -> dict:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=duration:stream=index,codec_name,codec_type,width,height,r_frame_rate",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(out.stdout)
 
 
-def audio_dur(path: Path) -> float:
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-        capture_output=True, text=True, check=True)
-    return float(r.stdout.strip())
+def make_list(lines: list[Path], target: Path) -> None:
+    target.write_text("".join(f"file '{p.as_posix()}'\n" for p in lines), encoding="utf-8")
 
 
-def build_scene_clip(scene, work: Path, fps_out: int) -> Path:
-    """单场景: 帧序列 -> 插帧 30fps -> 按音频时长定长 -> 烧字幕 -> mp4 (无声段先出, 混音在 concat 后统一做)。"""
-    frames = sorted(Path(scene["frames_dir"]).glob("frame_*.png"))
-    if not frames:
-        sys.exit(f"{scene['frames_dir']} 中无 frame_*.png")
-    fps_in = scene.get("fps_in", 12)
-    clip = work / f"{scene['name']}_clip.mp4"
+def concat_with_transition(scene_videos: list[Path], lengths: list[float], out: Path,
+                           list_file: Path, kind: str, seconds: float, fps: int) -> None:
+    """Join scenes with an MG transition while preserving the original timeline length."""
+    if len(scene_videos) == 1 or kind == "none" or seconds <= 0:
+        make_list(scene_videos, list_file)
+        ffmpeg("-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", out)
+        return
 
-    cmd = ["ffmpeg", "-y", "-framerate", str(fps_in),
-           "-i", str(Path(scene["frames_dir"]) / "frame_%05d.png")]
-    if scene.get("audio"):
-        cmd += ["-i", str(scene["audio"])]  # 所有输入先声明，再写输出选项
-    # 12→30fps 帧复制；末尾克隆最后一帧留白，apad 同步补静音
-    vf = f"fps={fps_out},tpad=stop_mode=clone:stop_duration=2"
-    if scene.get("subtitle"):
-        sub_srt = work / f"{scene['name']}.srt"
-        dur = audio_dur(Path(scene["audio"])) if scene.get("audio") else 5.0
-        sub_srt.write_text(
-            f"1\n00:00:00,000 --> {fmt_ts(dur)}\n{scene['subtitle']}\n",
-            encoding="utf-8")
-        # Windows 盘符冒号必须转义，否则 ffmpeg 过滤器解析失败
-        sub_path = sub_srt.as_posix().replace(":", r"\:")
-        style = ("FontName=Microsoft YaHei,FontSize=12,PrimaryColour=&H00363A3B,"
-                 "BackColour=&H80FDF6E3,BorderStyle=3,Outline=0,Shadow=0,"
-                 "Alignment=2,MarginV=18")
-        vf += f",subtitles='{sub_path}':force_style='{style}'"
-    cmd += ["-vf", vf]
-    if scene.get("audio"):
-        cmd += ["-af", "apad", "-shortest",
-                "-c:a", "aac", "-ar", "44100", "-ac", "1"]
+    inputs: list[str] = []
+    for video in scene_videos:
+        inputs.extend(["-i", str(video)])
+    filters = [
+        f"[{i}:v]tpad=stop_mode=clone:stop_duration={seconds:.3f},format=yuv420p,setsar=1[v{i}]"
+        for i in range(len(scene_videos))
+    ]
+    previous = "v0"
+    offset = 0.0
+    kinds = ["fade", "slideleft", "wipeleft"] if kind == "mixed" else [kind]
+    for i in range(1, len(scene_videos)):
+        offset += lengths[i - 1]
+        label = f"x{i}"
+        xfade_kind = kinds[(i - 1) % len(kinds)]
+        filters.append(
+            f"[{previous}][v{i}]xfade=transition={xfade_kind}:duration={seconds:.3f}:"
+            f"offset={offset:.3f}[{label}]"
+        )
+        previous = label
+    total = sum(lengths)
+    filters.append(f"[{previous}]trim=duration={total:.3f},setpts=PTS-STARTPTS[outv]")
+    ffmpeg(*inputs, "-filter_complex", ";".join(filters), "-map", "[outv]",
+           "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+           "-pix_fmt", "yuv420p", "-r", str(fps), out)
+
+
+def loudnorm_filter(narration: Path) -> str:
+    """Two-pass loudnorm: measure once, then apply exact gain (target -16 LUFS)."""
+    base = "loudnorm=I=-16:TP=-1.5:LRA=11"
+    try:
+        probe = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", str(narration),
+             "-af", base + ":print_format=json", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+        match = re.search(r"\{\s*\"input_i\".*?\}", probe.stderr, re.DOTALL)
+        if not match:
+            raise ValueError("no loudnorm measurement in ffmpeg output")
+        m = json.loads(match.group(0))
+        precise = (
+            f"{base}:measured_I={m['input_i']}:measured_TP={m['input_tp']}:"
+            f"measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}:"
+            f"offset={m['target_offset']}:linear=true"
+        )
+        return f"highpass=f=80,{precise},alimiter=limit=0.97"
+    except (ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print(f"[warn] two-pass loudnorm unavailable ({exc}); using single pass")
+        return f"highpass=f=80,{base},alimiter=limit=0.97"
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--project", required=True)
+    ap.add_argument("--preview", action="store_true", help="assemble a ~25s preview from first scenes")
+    ap.add_argument("--bgm", help="optional background music file")
+    ap.add_argument("--bgm-gain", default="-24dB", help="gain applied to bgm before mixing")
+    ap.add_argument("--transition", choices=["none", "fade", "slideleft", "wipeleft", "mixed"],
+                    default="fade", help="MG transition between scenes; mixed cycles fade/slideleft/wipeleft")
+    ap.add_argument("--transition-ms", type=int, default=350,
+                    help="transition duration in milliseconds (default: 350)")
+    args = ap.parse_args()
+
+    project = Path(args.project).resolve()
+    storyboard = json.loads((project / "storyboard.json").read_text(encoding="utf-8"))
+    timeline = json.loads((project / "audio" / "timeline.json").read_text(encoding="utf-8"))
+    fps = int(storyboard.get("fps", 30))
+    width, height = storyboard.get("resolution", [1920, 1080])
+
+    selected = timeline["scenes"]
+    preview_duration = 0.0
+    if args.preview:
+        selected = []
+        for scene in timeline["scenes"]:
+            selected.append(scene)
+            preview_duration += scene["duration"]
+            if preview_duration >= 25:
+                break
+
+    render_dir = project / "render"
+    render_dir.mkdir(parents=True, exist_ok=True)
+    scene_videos: list[Path] = []
+    scene_lengths: list[float] = []
+    expected_video_duration = 0.0
+    for scene in selected:
+        sid = str(scene["id"]).zfill(2)
+        frames_dir = project / "frames" / f"scene_{sid}"
+        meta_path = frames_dir / "meta.json"
+        if not meta_path.exists():
+            raise SystemExit(f"missing frames for scene {sid}: run render_scene.py --batch first")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not scene_videos:
+            width, height = int(meta["width"]), int(meta["height"])
+        scene_length = int(meta["frames"]) / fps
+        scene_lengths.append(scene_length)
+        expected_video_duration += scene_length
+        pngs = sorted(frames_dir.glob("*.png"))
+        if len(pngs) != int(meta["frames"]):
+            raise SystemExit(f"scene {sid}: expected {meta['frames']} frames, found {len(pngs)}")
+        target = render_dir / f"scene_{sid}.mp4"
+        ffmpeg("-framerate", fps, "-i", frames_dir / "%05d.png",
+               "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+               "-pix_fmt", "yuv420p", "-r", fps, target)
+        scene_videos.append(target)
+
+    silent = render_dir / "silent_preview.mp4" if args.preview else render_dir / "silent.mp4"
+    list_file = render_dir / ("concat_preview.txt" if args.preview else "concat.txt")
+    concat_with_transition(scene_videos, scene_lengths, silent, list_file,
+                           args.transition, args.transition_ms / 1000.0, fps)
+
+    audio_dir = project / "audio"
+    narration = audio_dir / "narration_raw.wav"
+    if not narration.exists():
+        raise SystemExit("audio/narration_raw.wav missing: run tts_generate.py first")
+    final_audio = audio_dir / "final_audio.m4a"
+    norm = loudnorm_filter(narration)
+    if args.bgm:
+        ffmpeg("-i", narration, "-stream_loop", "-1", "-i", args.bgm,
+               "-filter_complex",
+               f"[0:a]{norm}[n];[1:a]volume={args.bgm_gain}[b];"
+               "[n][b]amix=inputs=2:duration=first:dropout_transition=0[a]",
+               "-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", final_audio)
     else:
-        cmd += ["-an"]
-    cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", str(clip)]
-    run(cmd)
-    return clip
+        ffmpeg("-i", narration, "-af", norm, "-c:a", "aac", "-b:a", "192k", "-ar", "48000", final_audio)
 
+    if args.preview:
+        preview_duration = expected_video_duration
+        preview_audio = audio_dir / "preview_audio.m4a"
+        ffmpeg("-i", final_audio, "-t", f"{preview_duration:.3f}", "-c", "copy", preview_audio)
+        final_audio = preview_audio
 
-def fmt_ts(sec: float) -> str:
-    ms = int(sec * 1000)
-    return f"{ms // 3600000:02d}:{ms % 3600000 // 60000:02d}:{ms % 60000 // 1000:02d},{ms % 1000:03d}"
+    output = project / ("video_preview.mp4" if args.preview else "video.mp4")
+    ffmpeg("-i", silent, "-i", final_audio,
+           "-c:v", "copy", "-c:a", "copy",
+           "-movflags", "+faststart", output)
 
-
-def main():
-    if len(sys.argv) < 4 or "--out" not in sys.argv:
-        print(__doc__)
-        sys.exit(1)
-    plan_path = Path(sys.argv[1])
-    out = Path(sys.argv[sys.argv.index("--out") + 1])
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    fps_out = plan.get("fps_out", 30)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        work = Path(tmp)
-        clips = []
-        if plan.get("cover"):
-            cover_clip = work / "cover.mp4"
-            run(["ffmpeg", "-y", "-loop", "1", "-i", str(plan["cover"]),
-                 "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
-                 "-t", str(COVER_SEC), "-vf", "scale=1920:1080",
-                 "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-                 "-r", str(fps_out),  # 与场景帧率一致，避免 concat 时间基错配
-                 "-c:a", "aac", "-ar", "44100", "-ac", "1",
-                 "-shortest", str(cover_clip)])
-            clips.append(cover_clip)
-
-        for scene in plan["scenes"]:
-            clips.append(build_scene_clip(scene, work, fps_out))
-
-        concat_list = work / "list.txt"
-        concat_list.write_text(
-            "".join(f"file '{c.as_posix()}'\n" for c in clips), encoding="utf-8")
-        merged = work / "merged.mp4"
-        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-             "-c", "copy", str(merged)])
-
-        # 统一响度归一, 保证各场景音量一致
-        run(["ffmpeg", "-y", "-i", str(merged), "-af", "loudnorm=I=-16:TP=-1.5",
-             "-c:v", "copy", str(out)])
-
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(out)],
-        capture_output=True, text=True, check=True)
-    print(f"OK -> {out}  duration={float(r.stdout):.1f}s")
+    probe = ffprobe(output)
+    streams = probe.get("streams", [])
+    v = next((s for s in streams if s.get("codec_type") == "video"), {})
+    a = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    duration = float(probe.get("format", {}).get("duration", 0))
+    expected = expected_video_duration
+    narration_duration = sum(float(s["duration"]) for s in selected)
+    checks = [
+        {"name": "ffprobe", "status": "pass" if v.get("codec_name") == "h264" and a.get("codec_name") == "aac" else "fail",
+         "evidence": f"video={v.get('codec_name')}, audio={a.get('codec_name')}"},
+        {"name": "resolution",
+         "status": "pass" if (v.get("width") == width and v.get("height") == height) else "fail",
+         "evidence": f"{v.get('width')}x{v.get('height')} expected {width}x{height}"},
+        {"name": "fps", "status": "pass" if abs(float(v.get("r_frame_rate", "0/1").split("/")[0]) /
+         max(1, int(v.get("r_frame_rate", "1/1").split("/")[1])) - fps) < 0.1 else "fail",
+         "evidence": str(v.get("r_frame_rate"))},
+        {"name": "duration", "status": "pass" if abs(duration - expected) < 0.2 else "fail",
+         "evidence": f"{duration:.3f}s vs frame duration {expected:.3f}s"},
+        {"name": "audio-fit",
+         "status": "pass" if -0.05 <= duration - narration_duration <= 1.0 else "fail",
+         "evidence": f"video {duration:.3f}s, narration {narration_duration:.3f}s (frame rounding is expected)"},
+    ]
+    manifest = {
+        "schema_version": "2.0",
+        "project": str(project),
+        "output": str(output),
+        "duration": duration,
+        "audio_duration": narration_duration,
+        "transition": {"type": args.transition,
+                       "duration_ms": args.transition_ms if args.transition != "none" else 0},
+        "width": width, "height": height, "fps": fps,
+        "files": [str(output), str(final_audio)],
+        "checks": checks,
+        "deviations": [],
+        "passed": all(c["status"] == "pass" for c in checks),
+    }
+    manifest_path = project / ("render_manifest_preview.json" if args.preview else "render_manifest.json")
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"output": str(output), "duration": duration, "passed": manifest["passed"],
+                      "manifest": str(manifest_path)}, ensure_ascii=False))
+    for c in checks:
+        if c["status"] != "pass":
+            print("  FAIL", c["name"], c["evidence"])
 
 
 if __name__ == "__main__":

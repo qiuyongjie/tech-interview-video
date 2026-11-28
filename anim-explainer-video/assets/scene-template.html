@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Anim Explainer Frame Harness</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B1020; overflow: hidden; }
+  canvas#stage { display: block; }
+  @font-face { font-family: "VideoSans"; src: local("Microsoft YaHei"), local("微软雅黑"), local("Noto Sans CJK SC"); }
+  @font-face { font-family: "VideoMono"; src: local("Consolas"), local("Menlo"), local("DejaVu Sans Mono"); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+window.__STYLE = __STYLE_JSON__;
+window.__TIMELINE = __TIMELINE_JSON__;
+window.__SCENE_ID = __SCENE_ID_JSON__;
+window.__RENDER_CONFIG = __CONFIG_JSON__;
+</script>
+<script src="__RUNTIME_SRC__"></script>
+<script src="__SCENE_SRC__"></script>
+<script>
+if (window.__installRuntime) window.__installRuntime();
+</script>
+</body>
+</html>

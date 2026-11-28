@@ -1,116 +1,161 @@
 ---
 name: anim-explainer-video
-description: 根据任意技术主题自动生成讲解型动画视频（如"Java 链表转红黑树的过程"）。全流程含知识检索、人工审核、动画设计、关键帧预览、批量生成与配音合成四个阶段和三个审核卡点。技术路线为混合式：结构动画用 Canvas/SVG 程序化渲染保证精确性，封面/氛围图用 AI 生图；配音用本地免费 TTS；输出 1080p、默认 3~5 分钟。当用户要求"做一个讲解动画视频""把某主题做成动画""生成教学视频"时使用本 Skill。
+description: 将一个技术主题做成带配音与字幕的讲解型动画视频（1080p/30fps）。采用契约驱动的 audio-first 管线：storyboard.json 为唯一事实源，逐句 TTS 实测时长驱动时间轴，确定性 Canvas 逐帧渲染，强制画面质检。当用户要求"做讲解动画视频""把某主题做成动画""生成教学视频"时使用本 Skill；不适用于真人实拍、照片级 3D 或复刻已有视频。
 ---
 
-# Anim Explainer Video
+# Anim Explainer Video（v2 · 契约驱动重构版）
 
-## Overview
+> **启动自检（重要）**：执行前先用文件读取工具直接打开本文件的绝对路径，确认开头为 `v2 · 契约驱动重构版` 且正文包含 `audio-first` 与 `storyboard.json`。若通过 `@skill` 加载到的仍是含 `12fps 插帧`、`references/storyboard-guide.md` 的旧文本，那是会话启动时缓存的旧版本，**不要照旧文执行**；以磁盘上的 v2 文件为准，并重新读取 `references/` 与 `scripts/`。此缓存只影响当前会话的文本加载，不影响任何脚本与产出。
 
-将一个技术主题转化为讲解型动画视频。核心流程：**知识检索 → 人工审核 → 动画设计 → 人工审核 → 关键帧预览 → 人工审核 → 批量生成与合成**。
+## 概览
 
-三条铁律（任何情况下不得跳过）：
+流程：**初始化 → 知识检索 ✋ → 动画设计 ✋ → 配音与样片 ✋ → 批量渲染与合成**。
+每个场景是一个纯函数 `render(ctx, t, S)`，`t` 为场景内 0~1 进度；以原生 30fps 逐帧渲染（不做插帧），保证文字锐利、可复现、可单场景返工。
 
-1. **三个卡点必须人工确认**：知识资料、动画设计、关键帧，未经用户明确确认（如"确认""通过""可以"）不得进入下一阶段。用户提出修改意见时，修改后重新提交确认。
-2. **Audio-first 时序**：先为每段旁白生成 TTS 音频并测得实际时长，由音频时长反推每个分镜的帧数，禁止先定帧数再配音。
-3. **场景脚本化渲染**：每个分镜写成一个确定性渲染脚本 `render(ctx, t)`（t 为 0~1 的场景进度），以 12fps 渲染，再用 ffmpeg 插帧平滑到 30fps。任何一帧出错只需重跑对应场景。
+### 五条铁律（不得跳过）
+
+1. **三个卡点必须人工确认**：知识资料、动画设计（含解说词定稿）、关键帧与样片。用户明确说"确认/通过/可以"才进入下一阶段；有修改意见则改完重新提交。解说词在卡点 2 定稿，之后改词意味着重新配音并重排全片帧号，必须回到卡点 2。
+2. **Audio-first**：先逐句合成 TTS、用实测采样数得到每句精确起止（`audio/timeline.json`），再由它决定帧数与字幕时间。禁止估算时长、禁止先定帧数再配音。
+3. **契约驱动**：`storyboard.json` 是唯一事实源。渲染脚本不得自行发明时间、字幕或数字；屏幕上的每个数字/术语必须能追溯到 `research.md`。任何偏差记录为 `deviation` 并询问用户，不得静默修改。
+4. **确定性渲染**：`render(ctx,t,S)` 必须是纯函数——禁用 `Date.now()`、未播种随机、渲染期联网；字体先加载完成再截帧；同一帧重渲结果一致。
+5. **必须看画面**：关键帧、样片、成片都要实际查看（contact sheet + 布局检查 + ffprobe）。"旁白说 D=10、画面写 D=8"这类错误只能靠看帧发现。
 
 ## 默认配置
 
-| 参数 | 默认值 |
+| 参数 | 默认 |
 |---|---|
-| 总时长 | 3~5 分钟（用户可指定） |
-| 分辨率/帧率 | 1920×1080 / 输出 30fps（渲染 12fps 后插帧） |
+| 时长 | 3~5 分钟（用户可指定） |
+| 分辨率/帧率 | 1920×1080 / 30fps 原生逐帧（**不插帧**） |
 | 语言 | 中文（旁白+字幕） |
-| TTS | 本地免费方案：优先 edge-tts（逐句合成+句间停顿），不可用则回退 Windows SAPI |
-| 审核形式 | 对话内图片预览 + 文字摘要 |
-| 中间产物 | 保留在 `output/<topic>/` 下（frames/audio/scenes） |
-| 信息密度 | 每帧最多引入 1 个新概念；单段旁白不超过 3 句 |
+| 渲染器 | Canvas 2D + Playwright 无头 Chromium；封面/氛围图可用 AI 生图 |
+| TTS | 默认 edge-tts（免费，逐句合成+词级边界）；可选 Azure / ElevenLabs 升档 |
+| 音色 | `zh-CN-YunxiNeural`（年轻男声，讲解自然）；卡点 3 提供 2~3 个试听 |
+| 字幕 | 烧录在画布内，按句出现、按词高亮（词级边界来自 TTS） |
+| 场景转场 | 合成器统一加 350ms 转场；推荐 `--transition mixed`（fade/slideleft/wipeleft 交替），避免全片只有淡入淡出 |
+| 画面运动 | 运行时强制叠加持续镜头推拉/微位移/视差点阵/扫描光，字幕层不受影响；QA 会检测相邻帧是否真的在动 |
+| 中间产物 | 成片后运行 `cleanup.py` 清理帧序列/渲染缓存/音频分段，保留源码契约、报告、`video.mp4` 与 `keyframes/contact.png` |
+| 信息密度 | 每帧最多 1 个新概念；单镜旁白不超过 3 句、不超过 10 秒 |
 
-所有参数均可被用户覆盖。开始阶段 1 前，向用户确认一遍默认配置（简短列出即可，用户未反对即采用）。
+开始时简短列出默认配置，用户未反对即采用。所有参数可覆盖。
 
-## Stage 1：知识检索
-
-1. 用 web_search / web_fetch 检索主题，优先来源：官方文档、JDK/JVM 源码、权威教材、高赞技术博客。
-2. 产出 `output/<topic>/research.md`：
-   - 每个知识点单独列出，附来源 URL 与置信度（高/中/低）
-   - 冲突说法显式标注（如不同 JDK 版本阈值差异）
-   - 结尾附"讲解切入角度建议"（3 个候选叙事线）
-3. **卡点 ✋**：在对话内以摘要形式提交审核，等待用户确认或修正。用户补充资料时合并进 research.md 后再次确认。
-
-## Stage 2：动画设计
-
-输入为已确认的 research.md。先阅读 `references/storyboard-guide.md` 获取分镜设计规范，再产出 `output/<topic>/design.md`，必须包含：
-
-- **分镜脚本**：每个分镜一段，含 场景编号、画面内容描述、旁白文本、预计时长、动画要点（哪些元素出现/移动/高亮）、转场方式
-- **视觉风格**：色板（背景/主色/强调色/代码色，给具体 hex 值）、字体（正文 + 等宽代码字体）、2D 线稿/Canvas 图形风格的具体描述
-- **帧生成方式**：哪些场景用 Canvas 程序化绘制（默认全部结构场景），封面/氛围图用 AI 生图（列出需要的图及提示词）
-- **音频规范**：TTS 音色、语速、是否加背景音乐
-- **字幕方案**：字幕文本与分镜一一对应，说明位置与样式
-- **封面设计**：AI 生图提示词 + 标题文案
-
-设计完成后**卡点 ✋**：在对话内以紧凑摘要（分镜数、总时长、每镜一句话）提交，等待确认。
-
-## Stage 3：关键帧预览
-
-1. 选取 3~6 个代表性分镜（首帧、核心转折帧、结尾帧），编写其 `render(ctx, t)` 场景脚本（见 `references/canvas-patterns.md`）。
-2. 用 `scripts/render_scene.py --scene <file> --frame t` 渲染单帧 PNG。
-3. 封面用 AI 生图生成（可用 image_gen 工具）。
-4. **卡点 ✋**：在对话内展示图片（附每张的说明），等待用户确认风格与质量。修改意见落实后重渲染受影响的帧再次提交。
-
-## Stage 4：批量生成与合成
-
-1. **配音先行**：对每个分镜的旁白运行 `scripts/tts_generate.py`，得到 `audio/scene_NN.mp3` 与时长 JSON。
-2. **反推帧数**：`帧数 = round(音频时长 × 12fps)`，写回分镜表。
-3. **批量渲染**：对每个分镜运行 `scripts/render_scene.py --scene <file> --batch`，输出 `frames/scene_NN/`。
-4. **合成**：运行 `scripts/compose_video.py`，完成：插帧到 30fps → 烧录字幕 → 每场景配音频 → 拼接 → 封面帧（约 2 秒）→ 输出 `output/<topic>/video.mp4`。
-5. 依赖 ffmpeg；若未安装，提示用户安装（Windows: `winget install ffmpeg`）。
-6. 成片后在对话内报告时长与文件路径，询问是否需要复核；节奏问题时只重做对应分镜。
-
-### 配音质量规范（治"人机味"）
-
-- **逐句合成**：脚本自动按句级标点切分旁白，逐句送 TTS 后以 `gap_ms`（默认 320ms）拼接句间停顿，模拟真人讲稿的呼吸节奏。逗号微停顿由 TTS 自身处理。
-- **语速护栏**：`rate` 被限制在 `[-5%, +8%]`。需要放慢节奏时，**加大 `gap_ms` 或延长分镜末尾留白**，不要大幅降低语速——低于 -10% 会拖沓失真、机器感更强。
-- **音色选择**（zh-CN 实测自然度）：
-  | 音色 | 特点 | 适用 |
-  |---|---|---|
-  | `zh-CN-XiaoxiaoNeural` | 温和女声 | 通用讲解（默认） |
-  | `zh-CN-YunxiNeural` | 年轻男声、口语感 | 活泼/面试闲聊风 |
-  | `zh-CN-YunyangNeural` | 新闻男声、稳重 | 正式主题 |
-  | `zh-CN-XiaoyiNeural` | 活泼女声 | 轻快主题 |
-  用户反馈"人机味重"时，优先级：换音色（Xiaoxiao→Yunxi）→ 加大 `gap_ms` → 微调 `pitch`（±2Hz 内），而不是动语速。
-- **旁白文案配合**（Stage 2 写旁白时就注意）：口语短句、每句一个信息点、避免书面长定语；长句在 TTS 里无论如何调参都念不出节奏。
-
-## 目录约定
+## 目录结构
 
 ```
 output/<topic>/
-├── research.md          # 阶段1产出
-├── design.md            # 阶段2产出
-├── scenes/scene_NN.js   # 每个分镜的 render(ctx, t) 渲染脚本
-├── keyframes/           # 阶段3关键帧
-├── audio/               # TTS 音频 + durations.json
-├── frames/scene_NN/     # 批量渲染的帧序列
-└── video.mp4            # 成品
+├── research.md            卡点1：带 URL 与置信度的资料
+├── design.md              卡点2：叙事线 + 视觉风格 + 分镜一句话
+├── storyboard.json        卡点2：机器可读契约（时间/字幕/数字/样式）
+├── lexicon.json           读音与术语替换（TTS 用）
+├── audio/
+│   ├── audition/          音色试听（卡点3）
+│   ├── segments/          逐句音频 + 词边界缓存
+│   ├── timeline.json      精确时间轴（场景/句/词）
+│   └── narration_raw.wav  拼接后的原始旁白
+├── scenes/scene_NN.js     每镜一个 render(ctx,t,S) 纯函数
+├── runtime/               从 skill assets 复制的渲染运行时
+├── keyframes/             卡点3关键帧 + contact.png
+├── frames/scene_NN/       批量帧序列 + meta.json
+├── qa/report.json         布局/越界/控制台检查
+├── render/scene_NN.mp4    场景无声视频
+├── video.mp4              成品
+└── render_manifest.json   ffprobe 校验结果
 ```
 
-## Scripts
+Skill 自带资源：`references/`（契约/视觉/场景配方/音频/质检）、`assets/`（运行时与 HTML 模板）、`scripts/`（可直接执行的 Python 工具）。**不要手写这些工具的替代实现**；先运行 `scripts/doctor.py` 检查依赖。
 
-- `scripts/tts_generate.py` — 生成旁白音频并输出时长 JSON。逐句合成+句间停顿拼接（`gap_ms` 可配），语速护栏 `[-5%, +8%]`。优先 edge-tts（`pip install edge-tts`），失败回退 Windows PowerShell System.Speech。
-- `scripts/render_scene.py` — 通过 Playwright 无头浏览器加载场景 HTML，渲染单帧（`--frame 0.5`）或整段帧序列（`--batch`）。依赖：`pip install playwright` 且 `playwright install chromium`。
-- `scripts/compose_video.py` — 读取 durations.json，插帧、拼场景、混音、烧字幕，合成最终 mp4。依赖 ffmpeg。
+## 工作流
 
-运行前先检查依赖是否可用，缺失时明确告知用户并给出安装命令，不要静默降级。
+### Stage 0 · 初始化（无卡点）
 
-## References
+```bash
+python <skill>/scripts/doctor.py
+python <skill>/scripts/init_project.py --topic "主题名" --dir "output/<topic>"
+```
+依赖缺失时明确告知用户安装命令，不要静默降级（Windows 已验证可用：Python 3.11、ffmpeg、edge-tts、playwright chromium、Pillow、numpy）。
 
-- `references/storyboard-guide.md` — 分镜设计规范：叙事结构、信息密度、旁白写法、转场选择、讲解型动画的常见误区。**Stage 2 开始前必读。**
-- `references/canvas-patterns.md` — Canvas 绘制模式库：节点/链表/树/箭头/高亮/代码面板等可复用绘制函数与 render(ctx, t) 场景脚本模板。**Stage 3/4 编写场景脚本时必读。**
+### Stage 1 · 知识检索 → 卡点 1
+
+检索官方文档/源码/权威资料，产出 `research.md`：每个知识点附 URL、置信度（高/中/低）、冲突说法标注；结尾给 3 个候选叙事线。对话内提交摘要，等待确认。
+
+### Stage 2 · 动画设计 → 卡点 2
+
+**先读** `references/storyboard-contract.md` 与 `references/visual-design.md`。产出：
+
+- `storyboard.json`：场景、解说词逐句文本、claims、style_tokens、audio 配置（严格按契约 schema）
+- `design.md`：叙事线、每镜一句话意图、视觉风格说明、AI 生图提示词（仅限封面/氛围）
+
+旁白文案遵循 `references/audio-guide.md` 的"口语短句"规则：一句一个信息点，术语首次出现给比喻，避免长定语。提交紧凑摘要（镜头数、预计字数、每镜一句话），等待确认与**解说词定稿**。
+
+### Stage 3 · 配音与样片 → 卡点 3
+
+```bash
+# 1) 音色试听（用户选择后写入 storyboard.json 的 audio.voice）
+python <skill>/scripts/tts_generate.py --project "output/<topic>" --audition
+
+# 2) 正式配音：得到 timeline.json 与每条精确起止
+python <skill>/scripts/tts_generate.py --project "output/<topic>"
+
+# 3) 编写 3~6 个代表性场景脚本（见 references/scene-recipes.md），渲染关键帧
+python <skill>/scripts/render_scene.py --project "output/<topic>" --scene 01 --frame 0.5
+python <skill>/scripts/qa_scene.py --project "output/<topic>" --scenes 01,03,08 --contact
+
+# 4) 样片：渲染前 1~2 镜的完整帧并合成 20~30 秒预览
+python <skill>/scripts/render_scene.py --project "output/<topic>" --scene 01 --batch
+python <skill>/scripts/compose_video.py --project "output/<topic>" --preview
+```
+在对话内展示关键帧、contact sheet 与样片，附"每句台词对应哪帧"的说明，等待确认。用户反馈"人机味重"时按 `references/audio-guide.md` 的顺序处理：换音色 → 调停顿 → 微调 pitch → 最后才考虑文案，**不要靠大幅降速**。
+
+### Stage 4 · 批量渲染与合成
+
+```bash
+# 若 storyboard 含 preroll（外部音频前置），先注入并同步时间轴
+python <skill>/scripts/inject_preroll.py --project "output/<topic>"
+
+python <skill>/scripts/render_scene.py --project "output/<topic>" --scene 00 --batch
+python <skill>/scripts/render_scene.py --project "output/<topic>" --scene 01 --batch
+# ... 对每个场景执行；可并行但需保持帧号连续
+
+python <skill>/scripts/qa_scene.py --project "output/<topic>" --contact
+python <skill>/scripts/compose_video.py --project "output/<topic>"
+python <skill>/scripts/cleanup.py --project "output/<topic>"
+```
+合成器自动完成：场景视频编码 → 拼接 → 旁白响度标准化（−16 LUFS / −1.5 dBTP）→ 混音 → 烧录字幕已在画布内 → ffprobe 校验 → `render_manifest.json`。报告时长、文件路径、校验结果；**成片确认无误后再运行 `cleanup.py`** 删除帧序列、渲染缓存与音频分段。用户需要复用素材时可用 `--keep-frames --keep-keyframes --keep-audio` 保留；先用 `--dry-run` 预览删除清单。某镜有问题只重渲该镜，不要在清理后发现再全量重跑。
+
+## 脚本速查
+
+| 脚本 | 作用 | 关键参数 |
+|---|---|---|
+| `doctor.py` | 依赖体检 | `--json` |
+| `init_project.py` | 建目录、复制运行时、写 storyboard 骨架 | `--topic --dir --force` |
+| `tts_generate.py` | 逐句 TTS + 词边界 + 精确时间轴 | `--project --provider --voice --audition --force` |
+| `inject_preroll.py` | 将外部音频（如角色音色）前置到镜 00 并同步时间轴/字幕 | `--project`（需 storyboard 中有 `preroll` 配置） |
+| `render_scene.py` | 单帧 / 批量帧渲染 | `--project --scene --frame 0.5 \| --batch [--draft] [--scale 2]` |
+| `qa_scene.py` | 越界/重叠/控制台检查 + 帧拼图 | `--project [--scenes 01,02] [--contact]` |
+| `compose_video.py` | 合成、MG 转场、响度、校验 | `--project [--preview] [--bgm path] [--transition fade\|slideleft\|wipeleft\|mixed\|none] [--transition-ms 350]` |
+| `cleanup.py` | 成片后清理中间产物 | `--project [--dry-run] [--keep-frames] [--keep-keyframes] [--keep-audio]` |
+
+## 配音质量要点（详见 `references/audio-guide.md`）
+
+- 逐句合成，按标点加停顿：句末 `。！？：` 后 350ms，句中 `，；、—` 后 120ms，其余 30ms；场景末尾留白 600ms。全部用 WAV 采样数计算，误差为 0。
+- edge-tts 的 `WordBoundary` 事件给出 100ns 为单位的词起止，转成秒后写进 timeline，供逐词字幕高亮；不要在句中切分 bookmark。
+- 多音字/英文缩写/数字读法写进 `lexicon.json`（如 `"RAG": "R A G"`），在送 TTS 前替换，**字幕保留原文**。
+- 语速护栏 `[-5%, +8%]`；低于 −10% 会拖沓失真。要放慢就加停顿或精简文案。
+- 升档：设置 `AZURE_SPEECH_KEY`+`AZURE_REGION` 可用 Azure 神经语音的 `narration-relaxed` 等风格；设置 `ELEVENLABS_API_KEY` 可用 ElevenLabs 多语种 v2（中文情感更强）。两者都输出同一 timeline 格式。
+
+## 视觉质量要点（详见 `references/visual-design.md`；浅色白板风见 `references/style-whiteboard.md`）
+
+- 语义色板：一种颜色只有一个含义（实体蓝、焦点黄、关系灰、正确绿、错误红、假设紫、数量金），全片不复用。
+- 字号阶梯：标题 64 / 小标题 44 / 正文 34 / 标签 26 / 字幕 30；正文与字幕不低于 24px。
+- 运动：快进慢出，默认 `easeOutCubic`；并列元素 stagger 60~100ms；场景转场 300~500ms。禁止线性位移当主要运动。
+- 一镜一论点，渐进揭示；先给比喻再给术语；画面上同时存在的元素不超过 7 个。
+- AI 生图只用于封面/氛围，**绝不用于数据结构状态**——状态必须程序绘制。
 
 ## 常见误区
 
-- 不要在知识检索阶段就开始写场景代码——资料未确认，返工成本极高。
-- 不要用 AI 生图渲染数据结构状态——状态必须精确，只能程序绘制；AI 生图仅限封面/氛围。
-- 不要假设音频时长等于旁白字数估算值——必须以 TTS 实测时长为准。
-- 不要用大幅负语速（<-10%）换时长或"压节奏"——正确做法是调 `gap_ms`、分镜留白，或回到 Stage 2 精简旁白文案。
-- 用户对某一帧不满意时，只重跑对应场景，不要全量重渲染。
+- 不要跳过卡点直接批量渲染；解说词定稿前不要写场景代码。
+- 不要用 12fps + ffmpeg 插帧：文字和线条会糊，v2 直接 30fps 原生渲染。
+- 不要估算音频时长或照字数推算帧数；一切以 `timeline.json` 为准。
+- 不要静默改字幕/数字/时序；有偏差写进 manifest 并询问。
+- 不要把字幕交给 ffmpeg 烧录：v2 由运行时按 timeline 画进画布，避免字体转义与对位漂移。
+- 不要把数千帧中间产物留在项目目录：成片复核后运行 `cleanup.py`；`--dry-run` 可先看清单。
+- 用户对某帧不满意时只重跑对应场景；改文案则回到卡点 2 重走配音与对位。

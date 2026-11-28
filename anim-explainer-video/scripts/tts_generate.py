@@ -1,233 +1,301 @@
 #!/usr/bin/env python3
-"""tts_generate.py — 为每个分镜生成旁白音频并输出时长 JSON。
+"""Audio-first TTS: per-sentence synthesis, exact sample timing, word boundaries, timeline.json."""
+from __future__ import annotations
 
-用法:
-    python tts_generate.py manifest.json --out-dir audio/
-manifest.json 格式（两种均可）:
-    # 简单列表
-    [
-      {"scene": "scene_01", "text": "旁白文本", "voice": "zh-CN-XiaoxiaoNeural",
-       "rate": "+0%", "pitch": "+0Hz", "gap_ms": 320},
-      ...
-    ]
-    # 带全局默认值
-    {
-      "defaults": {"voice": "zh-CN-XiaoxiaoNeural", "rate": "+0%", "gap_ms": 320},
-      "scenes": [ {"scene": "scene_01", "text": "..."}, ... ]
-    }
-
-输出:
-    audio/scene_01.mp3 ...
-    audio/durations.json  -> {"scene_01": 12.34, ...}
-
-合成策略（治"人机味"的关键）:
-  1. 逐句合成：按句级标点（。！？；!?;）切分旁白，每句单独送 TTS，
-     句与句之间插入 gap_ms 毫秒的自然停顿后拼接——模拟真人讲稿的呼吸节奏，
-     避免"整段匀速连念"的机器感。逗号停顿由 TTS 自身处理，不在句级切分。
-  2. 语速护栏：rate 限制在 [-5%, +8%]。需要放慢节奏时优先加大 gap_ms
-     或延长分镜末尾留白，禁止用大幅负语速（<-10% 会拖沓失真）。
-
-可选音色（zh-CN，实测自然度排序）:
-    zh-CN-XiaoxiaoNeural   温和女声（默认，讲解通用）
-    zh-CN-YunxiNeural      年轻男声，口语感强（活泼主题）
-    zh-CN-YunyangNeural    新闻男声，稳重（正式主题）
-    zh-CN-XiaoyiNeural     活泼女声（轻快主题）
-
-方案: 优先 edge-tts (pip install edge-tts)，失败则回退 Windows SAPI (System.Speech)。
-"""
+import argparse
+import asyncio
+import hashlib
 import json
+import math
+import os
 import re
-import shutil
 import subprocess
-import sys
+import wave
+import xml.sax.saxutils as xmlutil
 from pathlib import Path
 
-RATE_MIN, RATE_MAX = -5, 8          # 自然语速区间（百分比）
-DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
-DEFAULT_GAP_MS = 320                # 句间停顿
-SENT_SPLIT = re.compile(r"(?<=[。！？；!?;])")
+SAMPLE_RATE = 48000
+SENTENCE_END = "。！？：!?:"
+CLAUSE_END = "，、,；;—-"
+DEFAULT_AUDITION = "zh-CN-YunxiNeural,zh-CN-XiaoxiaoNeural,zh-CN-YunyangNeural"
 
 
-def clamp_rate(rate: str) -> str:
-    try:
-        v = int(float(str(rate).strip("+%")))
-    except (ValueError, TypeError):
-        return "+0%"
-    c = max(RATE_MIN, min(RATE_MAX, v))
-    if c != v:
-        print(f"  语速 {rate}% 超出自然区间 [{RATE_MIN}, {RATE_MAX}]，已收拢为 {c}%")
-    return f"{c:+d}%"
+def ffmpeg(*args: str) -> None:
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *[str(a) for a in args]], check=True)
 
 
-def load_items(manifest_path: Path) -> list[dict]:
-    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if isinstance(raw, dict):
-        defaults = {k: v for k, v in raw.get("defaults", {}).items()
-                    if k not in ("scene", "text")}
-        items = []
-        for it in raw.get("scenes", []):
-            merged = dict(defaults)
-            merged.update(it)
-            items.append(merged)
-        return items
-    return raw
+def wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as w:
+        return w.getnframes() / float(w.getframerate())
 
 
-def split_sentences(text: str) -> list[str]:
-    parts = [p.strip() for p in SENT_SPLIT.split(text)]
-    return [p for p in parts if p]
+def parse_rate(value: str) -> int:
+    m = re.fullmatch(r"([+-]?\d+)%", value or "+0%")
+    return int(m.group(1)) if m else 0
 
 
-def try_edge_tts(items, out_dir: Path) -> dict | None:
-    try:
-        import edge_tts  # noqa: F401
-        import asyncio
-    except ImportError:
-        return None
-
-    async def gen_sentence(text, voice, rate, pitch, out):
-        last = None
-        for attempt in range(3):  # 瞬时网络失败重试
-            try:
-                await edge_tts.Communicate(text, voice, rate=rate,
-                                           pitch=pitch).save(str(out))
-                return
-            except Exception as e:
-                last = e
-                out.unlink(missing_ok=True)
-                await asyncio.sleep(1.5)
-        raise last
-
-    async def run():
-        for item in items:
-            text = item["text"]
-            voice = item.get("voice", DEFAULT_VOICE)
-            rate = clamp_rate(item.get("rate", "+0%"))
-            pitch = item.get("pitch", "+0Hz")
-            gap = max(0, int(item.get("gap_ms", DEFAULT_GAP_MS))) / 1000
-            sents = split_sentences(text)
-            tmp = out_dir / f".tmp_{item['scene']}"
-            tmp.mkdir(exist_ok=True)
-            try:
-                if len(sents) <= 1:
-                    # 单句：直接合成
-                    await gen_sentence(text, voice, rate, pitch,
-                                       tmp / "s0.mp3")
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-v", "error", "-i", str(tmp / "s0.mp3"),
-                         "-ar", "24000", "-ac", "1", str(out_dir / f"{item['scene']}.mp3")],
-                        check=True, capture_output=True)
-                else:
-                    # 逐句合成 → wav，句间插停顿后 concat
-                    wavs = []
-                    for i, s in enumerate(sents):
-                        mp3 = tmp / f"s{i}.mp3"
-                        await gen_sentence(s, voice, rate, pitch, mp3)
-                        wav = tmp / f"s{i}.wav"
-                        subprocess.run(
-                            ["ffmpeg", "-y", "-v", "error", "-i", str(mp3),
-                             "-ar", "24000", "-ac", "1", str(wav)],
-                            check=True, capture_output=True)
-                        wavs.append(wav)
-                    # 组装 ffmpeg 命令: 句 wav + 句间 anullsrc 静音
-                    cmd = ["ffmpeg", "-y", "-v", "error"]
-                    fparts = []
-                    for i, wav in enumerate(wavs):
-                        cmd += ["-i", str(wav)]
-                        fparts.append(f"[{len(fparts)}:a]")
-                        if i < len(wavs) - 1:
-                            cmd += ["-f", "lavfi", "-t", f"{gap:.3f}",
-                                    "-i", "anullsrc=r=24000:cl=mono"]
-                            fparts.append(f"[{len(fparts)}:a]")
-                    fc = "".join(fparts) + f"concat=n={len(fparts)}:v=0:a=1[out]"
-                    cmd += ["-filter_complex", fc, "-map", "[out]",
-                            "-c:a", "libmp3lame", "-q:a", "4",
-                            str(out_dir / f"{item['scene']}.mp3")]
-                    subprocess.run(cmd, check=True, capture_output=True)
-            finally:
-                shutil.rmtree(tmp, ignore_errors=True)
-
-    try:
-        asyncio.run(run())
-    except Exception as e:
-        # 网络受限/服务无响应等，回退本地方案
-        print(f"edge-tts 失败({type(e).__name__}: {e})，回退 Windows SAPI")
-        return None
-    durations = measure_durations(items, out_dir)
-    if not durations or any(d <= 0 for d in durations.values()):
-        return None
-    return durations
+def parse_pitch(value: str) -> int:
+    m = re.fullmatch(r"([+-]?\d+)Hz", value or "+0Hz")
+    return int(m.group(1)) if m else 0
 
 
-def sapi_tts(items, out_dir: Path) -> dict:
-    """Windows 回退方案：PowerShell System.Speech，输出 WAV。"""
-    for item in items:
-        out = out_dir / f"{item['scene']}.wav"
-        escaped = item["text"].replace("'", "''")
-        ps = (
-            "Add-Type -AssemblyName System.Speech; "
-            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            "$s.SetOutputToWaveFile('" + str(out).replace("'", "''") + "'); "
-            "$s.Rate = " + str(_rate_to_int(item.get("rate", "+0%"))) + "; "
-            "$s.Speak('" + escaped + "')"
-        )
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True)
-    return measure_durations(items, out_dir)
+def guardrails(rate: str, pitch: str) -> tuple[str, str]:
+    r = max(-5, min(8, parse_rate(rate)))
+    p = max(-2, min(2, parse_pitch(pitch)))
+    if r != parse_rate(rate):
+        print(f"[warn] rate clamped to {r:+d}% (allowed -5%..+8%)")
+    if p != parse_pitch(pitch):
+        print(f"[warn] pitch clamped to {p:+d}Hz (allowed -2..+2Hz)")
+    return f"{r:+d}%", f"{p:+d}Hz"
 
 
-def _rate_to_int(rate: str) -> int:
-    try:
-        return max(-10, min(10, int(float(rate.strip("+%")))))
-    except ValueError:
-        return 0
+def prepare_text(text: str, lexicon: dict) -> str:
+    result = text
+    for key in sorted(lexicon, key=len, reverse=True):
+        result = result.replace(key, str(lexicon[key]))
+    return result
 
 
-def measure_durations(items, out_dir: Path) -> dict:
-    durations = {}
-    for item in items:
-        for ext in (".mp3", ".wav"):
-            f = out_dir / f"{item['scene']}{ext}"
-            if f.exists():
-                try:
-                    d = ffprobe_duration(f)
-                except Exception:
-                    f.unlink(missing_ok=True)  # 损坏文件，删除后看下一扩展名
-                    continue
-                durations[item["scene"]] = d
-                break
-    return durations
+def pause_after(text: str) -> float:
+    stripped = (text or "").strip()
+    if not stripped:
+        return 0.03
+    if stripped[-1] in SENTENCE_END:
+        return 0.35
+    if stripped[-1] in CLAUSE_END:
+        return 0.12
+    return 0.03
 
 
-def ffprobe_duration(path: Path) -> float:
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-        capture_output=True, text=True, check=True)
-    return round(float(r.stdout.strip()), 3)
+async def synth_edge(text: str, voice: str, rate: str, pitch: str, out_mp3: Path) -> list[dict]:
+    import edge_tts
+
+    comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, boundary="WordBoundary")
+    words: list[dict] = []
+    with out_mp3.open("wb") as fh:
+        async for event in comm.stream():
+            kind = event.get("type")
+            if kind == "audio":
+                fh.write(event["data"])
+            elif kind == "WordBoundary":
+                start = event["offset"] / 1e7
+                words.append({
+                    "text": event["text"],
+                    "start": round(start, 4),
+                    "end": round((event["offset"] + event["duration"]) / 1e7, 4)
+                })
+    return words
 
 
-def main():
-    if len(sys.argv) < 3 or "--out-dir" not in sys.argv:
-        print(__doc__)
-        sys.exit(1)
-    manifest_path = Path(sys.argv[1])
-    out_dir = Path(sys.argv[sys.argv.index("--out-dir") + 1])
+def synth_azure(text: str, voice: str, rate: str, pitch: str) -> bytes:
+    import requests
+
+    key = os.environ["AZURE_SPEECH_KEY"]
+    region = os.environ["AZURE_REGION"]
+    ssml = (
+        '<speak xmlns="http://www.w3.org/2001/10/Synthesis" '
+        'xmlns:mstts="https://www.w3.org/2001/mstts" version="1.0" xml:lang="zh-CN">'
+        f'<voice name="{xmlutil.escape(voice)}">'
+        '<mstts:express-as style="narration-relaxed" styledegree="1.0">'
+        f'<prosody rate="{xmlutil.escape(rate)}" pitch="{xmlutil.escape(pitch)}">'
+        f"{xmlutil.escape(text)}</prosody></mstts:express-as></voice></speak>"
+    )
+    resp = requests.post(
+        f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1",
+        headers={
+            "Ocp-Apim-Subscription-Key": key,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm",
+        },
+        data=ssml.encode("utf-8"),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def synth_elevenlabs(text: str, voice: str) -> bytes:
+    import requests
+
+    resp = requests.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice}",
+        headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"], "Accept": "audio/mpeg"},
+        json={
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {
+                "stability": 0.45, "similarity_boost": 0.75,
+                "style": 0.15, "use_speaker_boost": True,
+            },
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def segment_audio(text: str, cfg: dict, seg_dir: Path, force: bool) -> tuple[Path, list[dict], float]:
+    provider = cfg["provider"]
+    voice = cfg["voice"]
+    rate, pitch = cfg["rate"], cfg["pitch"]
+    key = hashlib.sha1(f"{provider}|{voice}|{rate}|{pitch}|{text}".encode("utf-8")).hexdigest()[:18]
+    wav_path = seg_dir / f"{key}.wav"
+    meta_path = seg_dir / f"{key}.json"
+    if wav_path.exists() and meta_path.exists() and not force:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        return wav_path, meta.get("words", []), wav_duration(wav_path)
+
+    if provider == "edge":
+        tmp = seg_dir / f"{key}.mp3"
+        words = asyncio.run(synth_edge(text, voice, rate, pitch, tmp))
+        ffmpeg("-i", tmp, "-ar", str(SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", wav_path)
+        tmp.unlink(missing_ok=True)
+    else:
+        if provider == "azure":
+            payload = synth_azure(text, voice, rate, pitch)
+        elif provider == "elevenlabs":
+            payload = synth_elevenlabs(text, voice)
+        else:
+            raise ValueError(f"unknown provider: {provider}")
+        raw = seg_dir / f"{key}.raw"
+        raw.write_bytes(payload)
+        ffmpeg("-i", raw, "-ar", str(SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", wav_path)
+        raw.unlink(missing_ok=True)
+        words = []
+
+    meta = {"text": text, "voice": voice, "provider": provider, "words": words,
+            "duration": round(wav_duration(wav_path), 6)}
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return wav_path, words, meta["duration"]
+
+
+def silence_wav(seconds: float, seg_dir: Path) -> Path:
+    ms = int(round(seconds * 1000))
+    path = seg_dir / f"silence_{ms:05d}ms.wav"
+    if not path.exists():
+        ffmpeg("-f", "lavfi", "-i", f"anullsrc=r={SAMPLE_RATE}:cl=mono",
+               "-t", f"{seconds:.6f}", "-ar", str(SAMPLE_RATE), "-ac", "1",
+               "-c:a", "pcm_s16le", path)
+    return path
+
+
+def concat_wavs(parts: list[Path], out: Path, seg_dir: Path) -> None:
+    list_file = seg_dir / f"concat_{out.stem}.txt"
+    list_file.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
+    ffmpeg("-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", out)
+    list_file.unlink(missing_ok=True)
+
+
+def audition(cfg: dict, audio_dir: Path, sample: str, voices: list[str]) -> None:
+    out_dir = audio_dir / "audition"
     out_dir.mkdir(parents=True, exist_ok=True)
-    items = load_items(manifest_path)
+    for voice in voices:
+        local = dict(cfg)
+        local["voice"] = voice
+        target = out_dir / f"{voice}.mp3"
+        print(f"audition: {voice} -> {target}")
+        tmp = out_dir / f"_{voice}.tmp.mp3"
+        asyncio.run(synth_edge(sample, voice, "+0%", "+0Hz", tmp))
+        tmp.replace(target)
 
-    durations = try_edge_tts(items, out_dir)
-    engine = "edge-tts"
-    if durations is None:
-        if sys.platform != "win32":
-            print("edge-tts 不可用且非 Windows，无法回退 SAPI。请: pip install edge-tts")
-            sys.exit(2)
-        durations = sapi_tts(items, out_dir)
-        engine = "windows-sapi"
 
-    (out_dir / "durations.json").write_text(
-        json.dumps(durations, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"OK engine={engine} scenes={len(durations)}")
-    print(json.dumps(durations, ensure_ascii=False))
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--project", required=True)
+    ap.add_argument("--provider", choices=["edge", "azure", "elevenlabs"])
+    ap.add_argument("--voice")
+    ap.add_argument("--rate")
+    ap.add_argument("--pitch")
+    ap.add_argument("--audition", action="store_true")
+    ap.add_argument("--audition-voices", default=DEFAULT_AUDITION)
+    ap.add_argument("--force", action="store_true")
+    args = ap.parse_args()
+
+    project = Path(args.project).resolve()
+    storyboard = json.loads((project / "storyboard.json").read_text(encoding="utf-8"))
+    lexicon = json.loads((project / "lexicon.json").read_text(encoding="utf-8")) if (project / "lexicon.json").exists() else {}
+    audio_dir = project / "audio"
+    seg_dir = audio_dir / "segments"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = dict(storyboard.get("audio", {}))
+    cfg["provider"] = args.provider or cfg.get("provider", "edge")
+    cfg["voice"] = args.voice or cfg.get("voice", "zh-CN-YunxiNeural")
+    cfg["rate"], cfg["pitch"] = guardrails(args.rate or cfg.get("rate", "+0%"),
+                                           args.pitch or cfg.get("pitch", "+0Hz"))
+
+    if args.audition:
+        sample = " ".join(c["text"] for s in storyboard["scenes"][:1] for c in s.get("narration", []))[:90]
+        sample = sample or "我们先看一个例子，理解它是怎么一步步工作的。"
+        audition(cfg, audio_dir, prepare_text(sample, lexicon),
+                 [v.strip() for v in args.audition_voices.split(",") if v.strip()])
+        return
+
+    fps = int(storyboard.get("fps", 30))
+    default_tail_ms = float(cfg.get("scene_tail_ms", 600))
+    timeline = {
+        "schema_version": "2.0",
+        "provider": cfg["provider"],
+        "voice": cfg["voice"],
+        "rate": cfg["rate"],
+        "pitch": cfg["pitch"],
+        "total_duration": 0.0,
+        "scenes": [],
+    }
+    full_parts: list[Path] = []
+    abs_start = 0.0
+
+    for scene in storyboard["scenes"]:
+        parts: list[Path] = []
+        cues: list[dict] = []
+        local_time = 0.0
+        for item in scene.get("narration", []):
+            original = item["text"]
+            spoken = prepare_text(original, lexicon)
+            wav_path, words, duration = segment_audio(spoken, cfg, seg_dir, args.force)
+            parts.append(wav_path)
+            words_scene = [{"text": w["text"],
+                            "start": round(local_time + w["start"], 4),
+                            "end": round(local_time + w["end"], 4)} for w in words]
+            cues.append({
+                "id": item["id"],
+                "text": original,
+                "start": round(local_time, 4),
+                "end": round(local_time + duration, 4),
+                "duration": round(duration, 4),
+                "words": words_scene,
+            })
+            local_time += duration
+            gap = pause_after(original)
+            if gap > 0:
+                parts.append(silence_wav(gap, seg_dir))
+                local_time += gap
+            print(f"[{scene['id']}/{item['id']}] {duration:.3f}s + {gap:.2f}s pause")
+        tail = float(scene.get("scene_tail_ms", default_tail_ms)) / 1000.0
+        if tail > 0:
+            parts.append(silence_wav(tail, seg_dir))
+            local_time += tail
+
+        if not parts:
+            raise SystemExit(f"scene {scene['id']} has no narration")
+        scene_wav = audio_dir / f"scene_{scene['id']}.wav"
+        concat_wavs(parts, scene_wav, seg_dir)
+        duration = wav_duration(scene_wav)
+        timeline["scenes"].append({
+            "id": scene["id"],
+            "start": round(abs_start, 4),
+            "duration": round(duration, 4),
+            "frames": math.ceil(duration * fps),
+            "cues": cues,
+        })
+        abs_start += duration
+        full_parts.append(scene_wav)
+
+    concat_wavs(full_parts, audio_dir / "narration_raw.wav", seg_dir)
+    timeline["total_duration"] = round(wav_duration(audio_dir / "narration_raw.wav"), 4)
+    (audio_dir / "timeline.json").write_text(
+        json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"timeline written: {audio_dir / 'timeline.json'} ({timeline['total_duration']:.2f}s)")
 
 
 if __name__ == "__main__":
